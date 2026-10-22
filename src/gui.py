@@ -26,7 +26,7 @@ class OMRScannerApp:
             font=("Arial", 11, "bold"), 
             bg="#2ecc71", 
             fg="white", 
-            px=15, py=5, 
+            padx=15, pady=5, 
             relief=tk.FLAT,
             cursor="hand2"
         )
@@ -39,7 +39,7 @@ class OMRScannerApp:
             font=("Arial", 11, "bold"), 
             bg="#3498db", 
             fg="white", 
-            px=15, py=5, 
+            padx=15, pady=5, 
             relief=tk.FLAT,
             cursor="hand2"
         )
@@ -77,10 +77,9 @@ class OMRScannerApp:
         rgb_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(rgb_img)
 
-        # Tính tỷ lệ scale vừa khung canvas
         w, h = pil_img.size
         scale = min(max_w / w, max_h / h)
-        new_w, new_h = int(w * scale), int(h * scale)
+        new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
 
         resized = pil_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
         return ImageTk.PhotoImage(resized)
