@@ -1,39 +1,22 @@
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 
-# -------------------------------------------------------------------
-# 1. CÁC HÀM SẴN CÓ CỦA BẠN (ORDER_POINTS, SCAN, EXTRACT)
-# -------------------------------------------------------------------
 def order_points(pts):
-    """
-    Sắp xếp 4 tọa độ góc theo đúng thứ tự: 
-    [0]: Top-Left (Trên-Trái), [1]: Top-Right (Trên-Phải), 
-    [2]: Bottom-Right (Dưới-Phải), [3]: Bottom-Left (Dưới-Trái)
-    """
     rect = np.zeros((4, 2), dtype="float32")
-    
-    # Sắp xếp theo trục X (Trái / Phải)
-    xSorted = pts[np.argsort(pts[:, 0]), :]
-    leftMost = xSorted[:2, :]
-    rightMost = xSorted[2:, :]
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]      # Top-left
+    rect[2] = pts[np.argmax(s)]      # Bottom-right
 
-    # Sắp xếp 2 điểm bên trái theo trục Y (Trên / Dưới)
-    leftMost = leftMost[np.argsort(leftMost[:, 1]), :]
-    (tl, bl) = leftMost
-
-    # Sắp xếp 2 điểm bên phải theo trục Y (Trên / Dưới)
-    rightMost = rightMost[np.argsort(rightMost[:, 1]), :]
-    (tr, br) = rightMost
-
-    rect[0] = tl
-    rect[1] = tr
-    rect[2] = br
-    rect[3] = bl
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]   # Top-right
+    rect[3] = pts[np.argmax(diff)]   # Bottom-left
     return rect
 
 
 def scan_and_flatten_paper(image_path_or_img, target_w=1200, target_h=1600):
+    """
+    TẦNG 1: NẮN PHẲNG TOÀN BỘ TỜ GIẤY BÀI THI (1200x1600 PX)
+    """
     if isinstance(image_path_or_img, str):
         image = cv2.imread(image_path_or_img)
     else:
@@ -45,23 +28,20 @@ def scan_and_flatten_paper(image_path_or_img, target_w=1200, target_h=1600):
     h_img, w_img = image.shape[:2]
     total_area = h_img * w_img
 
-    # 1. Tiền xử lý lọc nhiễu
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # 2. Dùng Canny để bắt viền mép giấy sắc nét hơn
-    edged = cv2.Canny(blur, 30, 150)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
 
-    # 3. Tìm Contour khung giấy lớn nhất
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
     paper_pts = None
     for c in contours:
         area = cv2.contourArea(c)
-        if area < (total_area * 0.25): # Yêu cầu viền giấy chiếm ít nhất 25% diện tích
+        if area < (total_area * 0.20):
             continue
 
         peri = cv2.arcLength(c, True)
@@ -70,12 +50,15 @@ def scan_and_flatten_paper(image_path_or_img, target_w=1200, target_h=1600):
         if len(approx) == 4:
             paper_pts = approx.reshape(4, 2)
             break
+        elif len(approx) > 4:
+            rect_rot = cv2.minAreaRect(c)
+            box = cv2.boxPoints(rect_rot)
+            paper_pts = np.int32(box)
+            break
 
-    # Dự phòng: Nếu không bắt được góc giấy rõ ràng, lấy toàn bộ khung ảnh gốc
     if paper_pts is None:
         paper_pts = np.array([[0, 0], [w_img, 0], [w_img, h_img], [0, h_img]], dtype="float32")
 
-    # 4. Nắn phẳng perspective
     rect = order_points(paper_pts)
     dst = np.array([
         [0, 0],
@@ -88,55 +71,78 @@ def scan_and_flatten_paper(image_path_or_img, target_w=1200, target_h=1600):
     scanned_paper = cv2.warpPerspective(image, M, (target_w, target_h))
     return scanned_paper
 
-def extract_answer_region(scanned_img):
+
+def extract_exact_table_roi(scanned_img, target_w=1000, target_h=600):
+    """
+    TẦNG 2: CẮT RIÊNG KHUNG BẢNG BÀI LÀM (1000x600 PX)
+    """
     h, w = scanned_img.shape[:2]
     
-    # 🛠️ TINH CHỈNH TỌA ĐỘ LỀ NGANGB
-    # roi_x1: Đẩy sang phải 0.090 để cắt sát vào phần chữ số 1)
-    roi_x1 = int(w * 0.090)
-    
-    # roi_x2: Thu gọn về 0.935 để bỏ khoảng trắng lề ngoài bên phải
-    roi_x2 = int(w * 0.935)
+    y1_rough = int(h * 0.52)
+    y2_rough = int(h * 0.96)
+    x1_rough = int(w * 0.05)
+    x2_rough = int(w * 0.95)
 
-    # Giữ nguyên khung chiều cao rất chuẩn
-    roi_y1 = int(h * 0.538)  
-    roi_y2 = int(h * 0.955)  
+    rough_crop = scanned_img[y1_rough:y2_rough, x1_rough:x2_rough]
+    crop_h, crop_w = rough_crop.shape[:2]
 
-    answer_roi = scanned_img[roi_y1:roi_y2, roi_x1:roi_x2]
-    return answer_roi
+    gray = cv2.cvtColor(rough_crop, cv2.COLOR_BGR2GRAY)
+    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 3)
+
+    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (int(crop_w * 0.3), 1))
+    horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horiz_kernel)
+
+    row_sums = np.sum(horizontal_lines, axis=1)
+    valid_rows = np.where(row_sums > (crop_w * 255 * 0.15))[0]
+
+    if len(valid_rows) >= 2:
+        y1_table = valid_rows[0]
+        y2_table = valid_rows[-1]
+        table_crop = rough_crop[y1_table:y2_table, 0:crop_w]
+    else:
+        table_crop = rough_crop
+
+    table_roi = cv2.resize(table_crop, (target_w, target_h))
+    return table_roi
 
 
-def crop_300_bubbles(answer_roi, target_size=(32, 32)):
-    h, w = answer_roi.shape[:2]
-    col_w = w / 4.0
-    row_h = h / 15.0
+def extract_and_draw_300_bubbles(table_roi, target_size=(32, 32)):
+    """
+    CHIA LƯỚI TOẠ ĐỘ CHUẨN XÁC CHỦ DỘNG TRÊN BẢNG 1000x600 PX
+    """
+    roi_h, roi_w = table_roi.shape[:2]
+    overlay_img = table_roi.copy()
 
     options = ['a', 'b', 'c', 'd', 'e']
     bubbles_list = []
 
+    # Bảng 1000px được chia đều làm 4 cột nhóm (mỗi nhóm rộng 250px)
+    group_w = roi_w / 4.0        # 250.0 px
+    row_h = roi_h / 15.0         # 40.0 px
+
+    # Trong 250px của mỗi nhóm:
+    # - 54px đầu tiên là dành riêng cho phần số thứ tự câu (vd: 1), 16), 31)...)
+    # - 188px tiếp theo chia đều cho 5 ô đáp án (mỗi ô rộng ~37.6px)
+    # - 8px cuối cùng là khoảng trống chừa vạch kẻ đứng phân cách nhóm
+    num_margin = int(group_w * 0.22)               # 55 px
+    opt_area_w = group_w - num_margin - 8.0         # 187.0 px
+    single_opt_w = opt_area_w / 5.0                # 37.4 px
+
     for col in range(4):
+        group_x1 = int(col * group_w)
+        opt_start_x = group_x1 + num_margin
+
         for row in range(15):
             q_num = col * 15 + row + 1
-            
-            x1_col = int(col * col_w)
-            x2_col = int((col + 1) * col_w)
-            y1_row = int(row * row_h)
-            y2_row = int((row + 1) * row_h)
-
-            cell_roi = answer_roi[y1_row:y2_row, x1_col:x2_col]
-            cell_h, cell_w = cell_roi.shape[:2]
-
-            # 🛠️ ĐIỀU CHỈNH CHÍNH: Tăng lên 25% để vượt qua số thứ tự 1), 16), 31), 46)
-            opt_start_x = int(cell_w * 0.25)
-            opt_total_w = cell_w - opt_start_x
-            single_opt_w = opt_total_w / 5.0
+            by1 = int(row * row_h)
+            by2 = int((row + 1) * row_h)
 
             for opt_idx, opt_char in enumerate(options):
-                bx1 = opt_start_x + int(opt_idx * single_opt_w)
-                bx2 = opt_start_x + int((opt_idx + 1) * single_opt_w)
+                bx1 = int(opt_start_x + opt_idx * single_opt_w)
+                bx2 = int(opt_start_x + (opt_idx + 1) * single_opt_w)
 
-                bubble_crop = cell_roi[0:cell_h, bx1:bx2]
-                bubble_resized = cv2.resize(bubble_crop, target_size, interpolation=cv2.INTER_AREA)
+                crop_patch = table_roi[by1:by2, bx1:bx2]
+                bubble_resized = cv2.resize(crop_patch, target_size, interpolation=cv2.INTER_AREA)
 
                 bubbles_list.append({
                     'question': q_num,
@@ -144,78 +150,17 @@ def crop_300_bubbles(answer_roi, target_size=(32, 32)):
                     'col': col,
                     'row': row,
                     'opt_idx': opt_idx,
-                    'image': bubble_resized
+                    'image': bubble_resized,
+                    'bbox': (bx1, by1, bx2, by2)
                 })
 
-    return bubbles_list
+                # Vẽ khung màu xanh lá đè trực tiếp lên vị trí ô tròn
+                cv2.rectangle(
+                    overlay_img, 
+                    (bx1 + 1, by1 + 1), 
+                    (bx2 - 1, by2 - 1), 
+                    (0, 255, 0), 
+                    1
+                )
 
-def build_grid_visualization(bubbles_list, patch_size=32, pad=2):
-    grid_rows = 15
-    grid_cols = 20
-
-    cell_dim = patch_size + pad * 2
-    gap_between_groups = 8
-
-    canvas_h = grid_rows * cell_dim
-    canvas_w = grid_cols * cell_dim + (3 * gap_between_groups)
-
-    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8) + 40
-
-    for item in bubbles_list:
-        r = item['row']
-        c_group = item['col']
-        opt_i = item['opt_idx']
-        
-        c_flat = c_group * 5 + opt_i
-        extra_gap = c_group * gap_between_groups
-        x_pos = c_flat * cell_dim + pad + extra_gap
-        y_pos = r * cell_dim + pad
-
-        img = item['image']
-        if len(img.shape) == 2:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-
-        canvas[y_pos:y_pos + patch_size, x_pos:x_pos + patch_size] = img
-
-        cv2.rectangle(
-            canvas,
-            (x_pos - 1, y_pos - 1),
-            (x_pos + patch_size, y_pos + patch_size),
-            (80, 80, 80),
-            1
-        )
-
-    return canvas
-
-
-# -------------------------------------------------------------------
-# 3. CHƯƠNG TRÌNH CHẠY DÙNG THỬ
-# -------------------------------------------------------------------
-if __name__ == "__main__":
-    IMAGE_PATH = "dataset/raw/001.jpg"  # Thay bằng đường dẫn ảnh bài thi của bạn
-
-    try:
-        # 1. Quét và nắn phẳng bài thi
-        scanned = scan_and_flatten_paper(IMAGE_PATH)
-
-        # 2. Trích xuất vùng bài làm 60 câu
-        answer_roi = extract_answer_region(scanned)
-
-        # 3. Cắt 300 ô trắc nghiệm nhỏ
-        bubbles = crop_300_bubbles(answer_roi)
-        print(f"✅ Đã trích xuất thành công: {len(bubbles)} ô trắc nghiệm!")
-
-        # 4. Tạo ảnh hiển thị dạng lưới
-        grid_img = build_grid_visualization(bubbles)
-
-        # 5. Hiển thị bằng OpenCV
-        cv2.imshow("Answer ROI", answer_roi)
-        cv2.imshow("300 Bubbles Grid (15x20)", grid_img)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
-
-        # Hoặc lưu lại file ảnh lưới nếu cần
-        # cv2.imwrite("bubbles_grid_output.jpg", grid_img)
-
-    except Exception as e:
-        print(f"❌ Lỗi xử lý: {e}")
+    return bubbles_list, overlay_img
