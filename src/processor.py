@@ -2,6 +2,7 @@ import os
 import cv2
 import numpy as np
 
+# PyTorch là tùy chọn: nếu không có model, chương trình dùng fallback OMR.
 HAS_TORCH = False
 try:
     import torch
@@ -9,33 +10,32 @@ try:
     import torch.nn.functional as F
     HAS_TORCH = True
 except ImportError:
-    HAS_TORCH = False
+    pass
+
+# OCR là tùy chọn. Cần cài pytesseract và Tesseract OCR riêng trên Windows.
+HAS_OCR = False
+try:
+    import pytesseract
+    HAS_OCR = True
+except ImportError:
+    pass
 
 
-# ==============================================================================
-# KIẾN TRÚC MẠNG OMRPATCHNET ĐỒNG BỘ NGUYÊN BẢN TỪ FILE HUẤN LUYỆN COLAB
-# ==============================================================================
+# =============================================================================
+# CNN - GIỮ NGUYÊN KIẾN TRÚC MODEL CŨ
+# =============================================================================
 if HAS_TORCH:
     class OMRPatchNet(nn.Module):
         def __init__(self, num_classes=7):
-            super(OMRPatchNet, self).__init__()
-
-            # Block 1: Input (3, 32, 32) -> Output (32, 16, 16)
+            super().__init__()
             self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
             self.bn1 = nn.BatchNorm2d(32)
-
-            # Block 2: Input (32, 16, 16) -> Output (64, 8, 8)
             self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
             self.bn2 = nn.BatchNorm2d(64)
-
-            # Block 3: Input (64, 8, 8) -> Output (128, 4, 4)
             self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
             self.bn3 = nn.BatchNorm2d(128)
-
             self.pool = nn.MaxPool2d(2, 2)
             self.dropout = nn.Dropout(0.3)
-
-            # Fully Connected Layers
             self.fc1 = nn.Linear(128 * 4 * 4, 128)
             self.fc2 = nn.Linear(128, num_classes)
 
@@ -43,315 +43,472 @@ if HAS_TORCH:
             x = self.pool(F.relu(self.bn1(self.conv1(x))))
             x = self.pool(F.relu(self.bn2(self.conv2(x))))
             x = self.pool(F.relu(self.bn3(self.conv3(x))))
-
-            x = x.view(x.size(0), -1)  # Flatten
+            x = x.view(x.size(0), -1)
             x = self.dropout(F.relu(self.fc1(x)))
-            x = self.fc2(x)
-            return x
+            return self.fc2(x)
+
+
+# =============================================================================
+# CẤU HÌNH TEMPLATE PHIẾU HOA SEN
+# Các tỷ lệ được đo theo ảnh mẫu người dùng gửi. Trang đã được chuẩn hóa A4.
+# =============================================================================
+PAGE_W = 1200
+PAGE_H = 1697
+
+# Tâm các lựa chọn A-E theo tỷ lệ chiều rộng toàn trang.
+# Mỗi hàng có 5 lựa chọn; 4 nhóm tương ứng câu 1-15, 16-30, 31-45, 46-60.
+BUBBLE_X_RATIOS = [
+    [0.133, 0.164, 0.197, 0.231, 0.265],
+    [0.352, 0.386, 0.418, 0.450, 0.482],
+    [0.576, 0.608, 0.642, 0.674, 0.706],
+    [0.784, 0.816, 0.849, 0.882, 0.916],
+]
+BUBBLE_Y_TOP = 0.571
+BUBBLE_Y_BOTTOM = 0.925
+BUBBLE_PATCH = 40
+
+# Vùng bảng câu trả lời sau khi nắn trang (x1, y1, x2, y2), tỷ lệ trang.
+ANSWER_TABLE_BOX = (0.055, 0.545, 0.945, 0.955)
 
 
 def order_points(pts):
-    rect = np.zeros((4, 2), dtype="float32")
+    """Sắp xếp 4 điểm: trái-trên, phải-trên, phải-dưới, trái-dưới."""
+    pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
+    rect = np.zeros((4, 2), dtype=np.float32)
     s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1).reshape(-1)
     rect[0] = pts[np.argmin(s)]
     rect[2] = pts[np.argmax(s)]
-    diff = np.diff(pts, axis=1)
     rect[1] = pts[np.argmin(diff)]
     rect[3] = pts[np.argmax(diff)]
     return rect
 
 
-def scan_and_flatten_paper(image_path_or_img, target_w=1200, target_h=1600):
-    """TẦNG 1: Nắn phẳng toàn bộ tờ giấy bài thi."""
-    if isinstance(image_path_or_img, str):
-        image = cv2.imread(image_path_or_img)
+def _find_page_contour(image):
+    """Tìm vùng giấy sáng trên nền tối; có fallback minAreaRect."""
+    h, w = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (7, 7), 0)
+
+    # Otsu thích nghi ngưỡng theo độ sáng của từng ảnh.
+    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Đóng các khe nhỏ ở viền giấy, không dùng kernel quá lớn để tránh dính nền.
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    # Không chỉ lấy contour lớn nhất một cách mù quáng: lọc diện tích và tỷ lệ.
+    candidates = []
+    image_area = float(h * w)
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < image_area * 0.12:
+            continue
+        x, y, cw, ch = cv2.boundingRect(contour)
+        ratio = cw / max(ch, 1)
+        # A4 dọc trong ảnh có thể bị phối cảnh; cho phép tỷ lệ rộng hơn A4.
+        if 0.42 <= ratio <= 1.15:
+            candidates.append((area, contour))
+
+    if not candidates:
+        return None
+
+    contour = max(candidates, key=lambda item: item[0])[1]
+    perimeter = cv2.arcLength(contour, True)
+
+    # Thử nhiều epsilon để tìm tứ giác ổn định.
+    quad = None
+    for eps in (0.012, 0.018, 0.025, 0.035):
+        approx = cv2.approxPolyDP(contour, eps * perimeter, True)
+        if len(approx) == 4 and cv2.contourArea(approx) > image_area * 0.12:
+            quad = approx.reshape(4, 2)
+            break
+
+    if quad is None:
+        # Khi cạnh giấy cong/nhăn, contour có nhiều đỉnh. Min-area rectangle
+        # là fallback an toàn hơn việc lấy nhầm một contour nhỏ bên trong.
+        rect = cv2.minAreaRect(contour)
+        quad = cv2.boxPoints(rect)
+
+    return order_points(quad)
+
+
+def _refine_page_corners(image, corners):
+    """Tinh chỉnh nhẹ 4 góc theo cạnh gần nhất; không dịch quá xa."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 35, 120)
+    h, w = gray.shape
+    refined = corners.copy()
+
+    for i, (x, y) in enumerate(corners):
+        x0, x1 = max(0, int(x) - 18), min(w, int(x) + 19)
+        y0, y1 = max(0, int(y) - 18), min(h, int(y) + 19)
+        patch = edges[y0:y1, x0:x1]
+        ys, xs = np.where(patch > 0)
+        if len(xs) < 5:
+            continue
+        pts = np.column_stack((xs + x0, ys + y0)).astype(np.float32)
+        # Chọn điểm cạnh gần góc contour nhất để tránh nhảy sang chữ/đường kẻ.
+        d = np.sum((pts - np.array([x, y], dtype=np.float32)) ** 2, axis=1)
+        j = int(np.argmin(d))
+        candidate = pts[j]
+        if np.linalg.norm(candidate - [x, y]) <= 12:
+            refined[i] = candidate
+    return refined
+
+
+def scan_and_flatten_paper(image_path_or_img, target_w=PAGE_W, target_h=PAGE_H):
+    """
+    Phát hiện trang giấy và nắn về tỷ lệ A4 dọc.
+    Trả về ảnh gốc nếu không phát hiện được viền đáng tin cậy.
+    """
+    if isinstance(image_path_or_img, (str, os.PathLike)):
+        image = cv2.imread(str(image_path_or_img))
     else:
         image = image_path_or_img
 
     if image is None:
-        raise ValueError("Không thể mở file ảnh đầu vào!")
+        raise ValueError("Không thể mở ảnh đầu vào.")
 
-    h_img, w_img = image.shape[:2]
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    image = image.copy()
+    corners = _find_page_contour(image)
+    if corners is None:
+        raise ValueError(
+            "Không tìm thấy tờ giấy. Hãy chụp trên nền tối, đủ sáng và thấy đủ 4 cạnh."
+        )
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    corners = _refine_page_corners(image, corners)
+    dst = np.array([
+        [0, 0],
+        [target_w - 1, 0],
+        [target_w - 1, target_h - 1],
+        [0, target_h - 1]
+    ], dtype=np.float32)
 
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    matrix = cv2.getPerspectiveTransform(corners.astype(np.float32), dst)
+    warped = cv2.warpPerspective(
+        image, matrix, (target_w, target_h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE
+    )
 
-    paper_pts = None
-    for c in contours:
-        if cv2.contourArea(c) < (h_img * w_img * 0.20):
-            continue
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            paper_pts = approx.reshape(4, 2)
-            break
-        elif len(approx) > 4:
-            rect_rot = cv2.minAreaRect(c)
-            paper_pts = np.int32(cv2.boxPoints(rect_rot))
-            break
-
-    if paper_pts is None:
-        paper_pts = np.array([[0, 0], [w_img, 0], [w_img, h_img], [0, h_img]], dtype="float32")
-
-    rect = order_points(paper_pts)
-    dst = np.array([[0, 0], [target_w - 1, 0], [target_w - 1, target_h - 1], [0, target_h - 1]], dtype="float32")
-    M = cv2.getPerspectiveTransform(rect, dst)
-    return cv2.warpPerspective(image, M, (target_w, target_h))
+    # Cân bằng sáng nhẹ để ổn định bước phát hiện đường kẻ/ô.
+    lab = cv2.cvtColor(warped, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    warped = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+    return warped
 
 
-def extract_exact_table_roi(scanned_img, target_w=1000, target_h=600):
-    """TẦNG 2: Cắt bảng 60 câu nắn về 1000x600 px."""
+def extract_exact_table_roi(scanned_img, target_w=1068, target_h=696):
+    """Cắt bảng 60 câu theo template đã hiệu chỉnh, không dò contour lớn nhất."""
     h, w = scanned_img.shape[:2]
-    rough_crop = scanned_img[int(h * 0.50):int(h * 0.97), int(w * 0.03):int(w * 0.97)]
-    crop_h, crop_w = rough_crop.shape[:2]
+    x1, y1, x2, y2 = ANSWER_TABLE_BOX
+    left, top = int(x1 * w), int(y1 * h)
+    right, bottom = int(x2 * w), int(y2 * h)
+    roi = scanned_img[top:bottom, left:right].copy()
+    if roi.size == 0:
+        raise ValueError("Không cắt được vùng bảng trắc nghiệm.")
+    return cv2.resize(roi, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
 
-    gray = cv2.cvtColor(rough_crop, cv2.COLOR_BGR2GRAY)
-    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 3)
 
-    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (int(crop_w * 0.25), 1))
-    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, int(crop_h * 0.25)))
-
-    horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horiz_kernel)
-    vertical_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vert_kernel)
-    table_mask = cv2.add(horizontal_lines, vertical_lines)
-
-    contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    table_pts = None
-    if contours:
-        c_max = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(c_max) > (crop_h * crop_w * 0.30):
-            peri = cv2.arcLength(c_max, True)
-            approx = cv2.approxPolyDP(c_max, 0.02 * peri, True)
-            if len(approx) == 4:
-                table_pts = approx.reshape(4, 2)
-            else:
-                rect_rot = cv2.minAreaRect(c_max)
-                table_pts = np.int32(cv2.boxPoints(rect_rot))
-
-    if table_pts is not None:
-        rect = order_points(table_pts)
-        dst = np.array([[0, 0], [target_w - 1, 0], [target_w - 1, target_h - 1], [0, target_h - 1]], dtype="float32")
-        M = cv2.getPerspectiveTransform(rect, dst)
-        table_roi = cv2.warpPerspective(rough_crop, M, (target_w, target_h))
-    else:
-        table_roi = cv2.resize(rough_crop, (target_w, target_h))
-
-    return table_roi
+def _detect_circle_centers(gray):
+    """Phát hiện vòng tròn in sẵn; chỉ dùng để hiệu chỉnh tâm quanh template."""
+    work = cv2.medianBlur(gray, 5)
+    circles = cv2.HoughCircles(
+        work, cv2.HOUGH_GRADIENT,
+        dp=1.2, minDist=18,
+        param1=100, param2=19,
+        minRadius=7, maxRadius=19
+    )
+    if circles is None:
+        return np.empty((0, 2), dtype=np.float32)
+    return circles[0, :, :2].astype(np.float32)
 
 
 def extract_and_draw_300_bubbles(table_roi, target_size=(32, 32)):
-    """TẦNG 3: TRÍCH XUẤT 300 Ô VỚI BỘ TỌA ĐỘ CÂN CHỈNH MỚI NHẤT CỦA BẠN."""
-    roi_h, roi_w = table_roi.shape[:2]
-    overlay_img = table_roi.copy()
+    """
+    Định vị 300 ô theo template Hoa Sen.
+    Hough Circle chỉ tinh chỉnh tâm trong bán kính nhỏ; nếu không phát hiện được
+    thì vẫn dùng tọa độ template để tránh mất ô.
+    """
+    h, w = table_roi.shape[:2]
+    overlay = table_roi.copy()
+    gray = cv2.cvtColor(table_roi, cv2.COLOR_BGR2GRAY)
+    detected = _detect_circle_centers(gray)
 
-    options = ['a', 'b', 'c', 'd', 'e']
-    bubbles_list = []
+    options = ["a", "b", "c", "d", "e"]
+    bubbles = []
+    row_ys = np.linspace(BUBBLE_Y_TOP, BUBBLE_Y_BOTTOM, 15) * h
 
-    group_w = roi_w / 4.0      # 250.0 px mỗi nhóm
-    y_margin_top = 10
-    y_margin_bottom = 31
-    active_h = roi_h - y_margin_top - y_margin_bottom
-    row_h = active_h / 15.0
+    # Tọa độ X đang tính theo toàn trang; chuyển về ROI bảng.
+    page_w = PAGE_W
+    page_h = PAGE_H
+    table_x1 = ANSWER_TABLE_BOX[0] * page_w
+    table_y1 = ANSWER_TABLE_BOX[1] * page_h
+    table_x2 = ANSWER_TABLE_BOX[2] * page_w
+    table_y2 = ANSWER_TABLE_BOX[3] * page_h
+    roi_scale_x = w / (table_x2 - table_x1)
+    roi_scale_y = h / (table_y2 - table_y1)
 
-    box_w = 40
-    box_h = 40
-
-    col_opt_x_ratios = [
-        [0.327, 0.476, 0.621, 0.768, 0.915],
-        [0.311, 0.466, 0.600, 0.750, 0.895],
-        [0.288, 0.430, 0.567, 0.714, 0.877],
-        [0.241, 0.420, 0.536, 0.688, 0.856]
-    ]
-
-    for col_idx in range(4):
-        group_x1 = col_idx * group_w
-        current_ratios = col_opt_x_ratios[col_idx]
-
+    for group_idx in range(4):
         for row_idx in range(15):
-            q_num = col_idx * 15 + row_idx + 1
-            cy = int(y_margin_top + (row_idx + 0.5) * row_h)
+            q_num = group_idx * 15 + row_idx + 1
+            page_y = row_ys[row_idx] + table_y1 * roi_scale_y
+            # BUBBLE_Y_TOP/BOTTOM là tỷ lệ trang, chuyển trực tiếp sang ROI.
+            cy_expected = (BUBBLE_Y_TOP + row_idx *
+                           (BUBBLE_Y_BOTTOM - BUBBLE_Y_TOP) / 14) * PAGE_H
+            cy = (cy_expected - table_y1) * roi_scale_y
 
             for opt_idx, opt_char in enumerate(options):
-                cx = int(group_x1 + group_w * current_ratios[opt_idx])
+                page_x = BUBBLE_X_RATIOS[group_idx][opt_idx] * PAGE_W
+                cx = (page_x - table_x1) * roi_scale_x
 
-                bx1 = max(0, cx - box_w // 2)
-                bx2 = min(roi_w, cx + box_w // 2)
-                by1 = max(0, cy - box_h // 2)
-                by2 = min(roi_h, cy + box_h // 2)
+                # Tinh chỉnh tâm bằng vòng tròn Hough gần vị trí kỳ vọng.
+                if len(detected):
+                    distances = np.linalg.norm(
+                        detected - np.array([cx, cy], dtype=np.float32), axis=1
+                    )
+                    nearest = int(np.argmin(distances))
+                    if distances[nearest] <= 10:
+                        cx, cy = detected[nearest]
 
-                crop_patch = table_roi[by1:by2, bx1:bx2]
-                if crop_patch.size > 0:
-                    bubble_resized = cv2.resize(crop_patch, target_size, interpolation=cv2.INTER_AREA)
+                half = BUBBLE_PATCH // 2
+                bx1, bx2 = max(0, int(round(cx)) - half), min(w, int(round(cx)) + half)
+                by1, by2 = max(0, int(round(cy)) - half), min(h, int(round(cy)) + half)
+                patch = table_roi[by1:by2, bx1:bx2]
+                if patch.size == 0:
+                    patch = np.full((BUBBLE_PATCH, BUBBLE_PATCH, 3), 255, np.uint8)
                 else:
-                    bubble_resized = np.zeros((target_size[1], target_size[0], 3), dtype=np.uint8)
+                    patch = cv2.resize(patch, target_size, interpolation=cv2.INTER_AREA)
 
-                bubbles_list.append({
-                    'question': q_num,
-                    'option': opt_char,
-                    'col': col_idx,
-                    'row': row_idx,
-                    'opt_idx': opt_idx,
-                    'image': bubble_resized,
-                    'bbox': (bx1, by1, bx2, by2)
+                bubbles.append({
+                    "question": q_num,
+                    "option": opt_char,
+                    "col": group_idx,
+                    "row": row_idx,
+                    "opt_idx": opt_idx,
+                    "image": patch,
+                    "bbox": (bx1, by1, bx2, by2),
+                    "center": (float(cx), float(cy))
                 })
+                cv2.rectangle(overlay, (bx1, by1), (bx2, by2), (0, 220, 0), 1)
+                cv2.circle(overlay, (int(cx), int(cy)), 2, (0, 0, 255), -1)
 
-                cv2.rectangle(overlay_img, (bx1, by1), (bx2, by2), (0, 255, 0), 1)
-
-    return bubbles_list, overlay_img
+    return bubbles, overlay
 
 
+# =============================================================================
+# OCR VÙNG THÔNG TIN - TỌA ĐỘ TEMPLATE SAU KHI NẮN TRANG A4
+# Các ô OCR là vùng trống sau nhãn in sẵn, không gồm phần chữ nhãn.
+# =============================================================================
+INFO_FIELDS = {
+    "Họ và tên": (0.205, 0.140, 0.435, 0.164),
+    "MSSV": (0.105, 0.183, 0.245, 0.204),
+    "Lớp": (0.285, 0.183, 0.435, 0.204),
+    "Kỳ thi / loại kỳ": (0.485, 0.140, 0.735, 0.164),
+    "Ngày thi": (0.535, 0.162, 0.735, 0.183),
+    "Phòng thi": (0.755, 0.162, 0.920, 0.183),
+    "Môn thi": (0.485, 0.185, 0.755, 0.207),
+    "Mã đề": (0.790, 0.185, 0.920, 0.207),
+    "Giám thị 1": (0.105, 0.224, 0.425, 0.245),
+    "Giám thị 2": (0.485, 0.224, 0.650, 0.245),
+    "Số phách": (0.790, 0.224, 0.920, 0.245),
+}
+
+
+def _prepare_ocr_crop(crop):
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    return gray
+
+
+def extract_student_information(scanned_img, tesseract_cmd=None, language="vie+eng"):
+    """
+    Cắt các trường thông tin và OCR nếu Tesseract đã được cài.
+    Trả về dict {field: text}, dict {field: crop}, trạng thái OCR.
+    Lưu ý: OCR chữ viết tay phụ thuộc chất lượng ảnh và không thể đảm bảo chính xác tuyệt đối.
+    """
+    if HAS_OCR:
+        # Có thể cấu hình đường dẫn Tesseract bằng biến môi trường TESSERACT_CMD.
+        # Tự dò vị trí cài đặt phổ biến trên Windows nếu chưa cấu hình.
+        configured_cmd = tesseract_cmd or os.environ.get("TESSERACT_CMD")
+        if not configured_cmd:
+            common_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+            if os.path.exists(common_path):
+                configured_cmd = common_path
+        if configured_cmd:
+            pytesseract.pytesseract.tesseract_cmd = configured_cmd
+
+    h, w = scanned_img.shape[:2]
+    values, crops = {}, {}
+    ocr_ready = HAS_OCR
+
+    for field, (x1, y1, x2, y2) in INFO_FIELDS.items():
+        left, top = int(x1 * w), int(y1 * h)
+        right, bottom = int(x2 * w), int(y2 * h)
+        crop = scanned_img[top:bottom, left:right].copy()
+        crops[field] = crop
+
+        if not HAS_OCR or crop.size == 0:
+            values[field] = "(Chưa OCR)"
+            continue
+
+        prepared = _prepare_ocr_crop(crop)
+        config = "--oem 3 --psm 7"
+        try:
+            text = pytesseract.image_to_string(
+                prepared, lang=language, config=config
+            ).strip()
+            values[field] = " ".join(text.split()) if text else ""
+        except Exception as exc:
+            values[field] = f"(Lỗi OCR: {exc})"
+            ocr_ready = False
+
+    return values, crops, ocr_ready
+
+
+# =============================================================================
+# LOAD MODEL + DỰ ĐOÁN 300 Ô
+# =============================================================================
 def load_pytorch_model(model_path):
-    """Nạp PyTorch Checkpoint (.pth) đã train từ Colab."""
-    if not HAS_TORCH or not os.path.exists(model_path):
+    if not HAS_TORCH or not model_path or not os.path.exists(model_path):
         return None, None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     try:
         checkpoint = torch.load(model_path, map_location=device)
         model = OMRPatchNet(num_classes=7)
-
         class_to_idx = None
+
         if isinstance(checkpoint, dict):
-            if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
+            if "model_state_dict" in checkpoint:
+                model.load_state_dict(checkpoint["model_state_dict"])
             else:
                 model.load_state_dict(checkpoint)
-            class_to_idx = checkpoint.get('class_to_idx', None)
+            class_to_idx = checkpoint.get("class_to_idx")
         else:
             model = checkpoint
 
         model.to(device)
         model.eval()
         return model, class_to_idx
-    except Exception as e:
-        print(f"Không thể nạp PyTorch Model từ {model_path}: {e}")
+    except Exception as exc:
+        print(f"Không thể nạp model {model_path}: {exc}")
         return None, None
 
 
+def _find_default_model():
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "models", "omr_model_best.pth"),
+        os.path.join(here, "models", "model_v1.pth"),
+        os.path.join(os.path.dirname(here), "models", "omr_model_best.pth"),
+        os.path.join(os.path.dirname(here), "models", "model_v1.pth"),
+    ]
+    return next((p for p in candidates if os.path.exists(p)), None)
+
+
 def predict_bubbles_with_cnn(bubbles_list, model_path=None):
-    """
-    SUY LUẬN CHÍNH XÁC VỚI MÔ HÌNH TRAIN TỪ COLAB (OMRPatchNet)
-    - Xử lý ảnh: RGB + ImageNet Normalization (mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    - Mapping 7 nhãn: 'crossed' -> Gạch X, 'filled' -> Tô, 'empty_*' -> Trắng
-    """
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if model_path is None:
-        model_path_best = os.path.join(base_dir, "models", "omr_model_best.pth")
-        model_path_v1 = os.path.join(base_dir, "models", "model_v1.pth")
-        model_path = model_path_best if os.path.exists(model_path_best) else model_path_v1
-
+    model_path = model_path or _find_default_model()
     model, class_to_idx = load_pytorch_model(model_path)
-    predictions = []
 
-    # Map mặc định 7 nhãn chuẩn từ PyTorch ImageFolder
-    # 0: crossed, 1..5: empty_a..e, 6: filled
-    default_classes = ['crossed', 'empty_a', 'empty_b', 'empty_c', 'empty_d', 'empty_e', 'filled']
-    idx_to_class = {i: cls_name for i, cls_name in enumerate(default_classes)}
-
-    if class_to_idx is not None:
+    default_classes = [
+        "crossed", "empty_a", "empty_b", "empty_c",
+        "empty_d", "empty_e", "filled"
+    ]
+    idx_to_class = {i: name for i, name in enumerate(default_classes)}
+    if class_to_idx:
         idx_to_class = {v: k for k, v in class_to_idx.items()}
 
+    predictions = []
     if model is not None and HAS_TORCH:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        tensor_list = []
-
-        # BỘ CHUẨN HÓA IMAGENET GIỐNG HỆT COLAB TRAIN
+        device = next(model.parameters()).device
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        tensors = []
 
         for item in bubbles_list:
-            img_bgr = item['image']  # (32, 32, 3) BGR từ OpenCV
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            rgb = cv2.cvtColor(item["image"], cv2.COLOR_BGR2RGB)
+            arr = rgb.astype(np.float32) / 255.0
+            arr = (arr - mean) / std
+            tensors.append(torch.from_numpy(arr).permute(2, 0, 1))
 
-            # Normalize [0, 1] -> Standardize ImageNet
-            norm_img = img_rgb.astype("float32") / 255.0
-            norm_img = (norm_img - mean) / std
-
-            # Chuyển HWC (32, 32, 3) -> CHW (3, 32, 32)
-            tensor_img = torch.tensor(norm_img, dtype=torch.float32).permute(2, 0, 1)
-            tensor_list.append(tensor_img)
-
-        batch_x = torch.stack(tensor_list).to(device)  # Shape (300, 3, 32, 32)
-
+        batch = torch.stack(tensors).to(device)
         with torch.no_grad():
-            outputs = model(batch_x)
-            _, preds = torch.max(outputs, 1)
-            predictions = preds.cpu().numpy().tolist()
+            logits = model(batch)
+            predictions = torch.argmax(logits, dim=1).cpu().tolist()
     else:
-        # Fallback đếm pixel mực nếu chưa nạp được PyTorch
+        # Fallback đơn giản; không thay thế được CNN đã huấn luyện.
         for item in bubbles_list:
-            gray = cv2.cvtColor(item['image'], cv2.COLOR_BGR2GRAY)
-            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-            fill_ratio = cv2.countNonZero(thresh) / float(thresh.shape[0] * thresh.shape[1])
-            predictions.append(6 if fill_ratio > 0.40 else 1)
+            gray = cv2.cvtColor(item["image"], cv2.COLOR_BGR2GRAY)
+            # Bỏ viền ngoài để giảm ảnh hưởng vòng tròn in sẵn.
+            inner = gray[7:-7, 7:-7]
+            _, th = cv2.threshold(
+                inner, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+            )
+            fill_ratio = cv2.countNonZero(th) / float(th.size)
+            predictions.append(6 if fill_ratio > 0.34 else 1)
 
-    options_map = ['A', 'B', 'C', 'D', 'E']
-    results_by_question = {}
+    options = ["A", "B", "C", "D", "E"]
+    by_question = {}
 
     for i, item in enumerate(bubbles_list):
-        q = item['question']
-        opt_idx = item['opt_idx']
-        pred_cls_idx = predictions[i]
-        cls_name = idx_to_class.get(pred_cls_idx, 'empty_a')
-
-        # QUY ĐỔI 7 NHÃN CỦA MÔ HÌNH VỀ 3 TRẠNG THÁI HIỂN THỊ
-        if cls_name == 'filled':
-            state_name = "Tô"
-        elif cls_name == 'crossed':
-            state_name = "Gạch X"
+        q = item["question"]
+        cls_name = idx_to_class.get(predictions[i], "empty_a")
+        if cls_name == "filled":
+            state = "Tô"
+        elif cls_name == "crossed":
+            state = "Gạch X"
         else:
-            state_name = "Trắng"
+            state = "Trắng"
 
-        if q not in results_by_question:
-            results_by_question[q] = {
-                'options_detail': {},
-                'valid_selected': [],
-                'crossed_selected': [],
-                'col': item['col'] + 1
-            }
-
-        opt_char = options_map[opt_idx]
-        results_by_question[q]['options_detail'][opt_char] = state_name
-
-        if state_name == "Tô":
-            results_by_question[q]['valid_selected'].append(opt_char)
-        elif state_name == "Gạch X":
-            results_by_question[q]['crossed_selected'].append(opt_char)
-
-    final_results = []
-    for q in range(1, 61):
-        info = results_by_question.get(q, {'options_detail': {}, 'valid_selected': [], 'crossed_selected': [], 'col': 1})
-        details = info['options_detail']
-        valid_sel = info['valid_selected']
-        crossed_sel = info['crossed_selected']
-
-        detail_str = " | ".join([f"{opt}:{details.get(opt, 'Trắng')}" for opt in options_map])
-
-        if len(valid_sel) == 1:
-            ans_str = valid_sel[0]
-            status = "Hợp lệ"
-        elif len(valid_sel) > 1:
-            ans_str = ",".join(valid_sel)
-            status = "Lỗi (Tô nhiều ô)"
-        else:
-            ans_str = "—"
-            status = "Bỏ câu"
-
-        final_results.append({
-            'question': q,
-            'col': info['col'],
-            'detail_str': detail_str,
-            'answer': ans_str,
-            'status': status,
-            'details': details,
-            'valid_selected': valid_sel,
-            'crossed_selected': crossed_sel
+        info = by_question.setdefault(q, {
+            "options_detail": {}, "valid_selected": [],
+            "crossed_selected": [], "col": item["col"] + 1
         })
+        opt = options[item["opt_idx"]]
+        info["options_detail"][opt] = state
+        if state == "Tô":
+            info["valid_selected"].append(opt)
+        elif state == "Gạch X":
+            info["crossed_selected"].append(opt)
 
-    return final_results
+    results = []
+    for q in range(1, 61):
+        info = by_question.get(q, {
+            "options_detail": {}, "valid_selected": [],
+            "crossed_selected": [], "col": (q - 1) // 15 + 1
+        })
+        details = info["options_detail"]
+        selected = info["valid_selected"]
+        detail_str = " | ".join(
+            f"{o}:{details.get(o, 'Trắng')}" for o in options
+        )
+
+        if len(selected) == 1:
+            answer, status = selected[0], "Hợp lệ"
+        elif len(selected) > 1:
+            answer, status = ",".join(selected), "Lỗi (Tô nhiều ô)"
+        else:
+            answer, status = "—", "Bỏ câu"
+
+        results.append({
+            "question": q,
+            "col": info["col"],
+            "detail_str": detail_str,
+            "answer": answer,
+            "status": status,
+            "details": details,
+            "valid_selected": selected,
+            "crossed_selected": info["crossed_selected"]
+        })
+    return results
